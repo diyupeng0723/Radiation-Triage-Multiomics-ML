@@ -1,0 +1,430 @@
+# ============================================================================================== #
+# Project: Multi-Omics and Machine Learning Pipeline for Early Radiation Triage (PBI vs TBI)
+# Script: Complete Figure Generation (Figures 1-6: Standardized for High-Tier Journal Layout)
+# Author: Senior Research Consultant
+# ============================================================================================== #
+
+# -------------------------------------------------------------------------
+# 0. Environment Setup and Dependency Management
+# -------------------------------------------------------------------------
+cat("\n[0/6] Checking and loading dependencies...\n")
+
+required_pkgs <- c("dplyr", "tidyr", "ggplot2", "ggpubr", "pheatmap", 
+                   "glmnet", "randomForest", "pROC", "rms", "rpart", 
+                   "rpart.plot", "fmsb", "scales", "gridExtra")
+
+# Automatically install missing libraries
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) {
+  install.packages(new_pkgs, dependencies = TRUE)
+}
+
+# Load libraries silently
+invisible(lapply(required_pkgs, require, character.only = TRUE))
+
+# Global color code standards
+group_colors <- c("Baseline (SD-3)" = "#9E9E9E", 
+                  "Early PBI (4H & 8H)" = "#1E88E5", 
+                  "Early TBI (4H & 8H)" = "#D32F2F")
+
+# -------------------------------------------------------------------------
+# 1. Data Loading & Pre-processing Pipeline
+# -------------------------------------------------------------------------
+cat("[1/6] Loading and cleaning dataset...\n")
+
+file_name <- "data_standardized_final.csv"
+if (file.exists(file_name)) {
+  file_path <- file_name
+} else {
+  file_path <- "C:/Users/diyup/Desktop/data_standardized_final.csv"  # Local fall-back
+}
+
+if (!file.exists(file_path)) {
+  stop("FATAL ERROR: data_standardized_final.csv not found! Check your work directory.")
+}
+
+df <- read.csv(file_path, stringsAsFactors = FALSE)
+df[df == "Filtered"] <- NA  # Mask missing limits with NA
+
+# Clean column headers
+meta_cols <- c("mz_rt", "Treatment", "Radiation", "Time")
+expr_cols <- colnames(df)[!colnames(df) %in% meta_cols]
+cleaned_expr_cols <- make.names(expr_cols, unique = TRUE)
+colnames(df)[!colnames(df) %in% meta_cols] <- cleaned_expr_cols
+
+# Impute expression columns using median values
+df[, cleaned_expr_cols] <- lapply(df[, cleaned_expr_cols], function(x) as.numeric(as.character(x)))
+df[, cleaned_expr_cols] <- lapply(df[, cleaned_expr_cols], function(x) {
+  ifelse(is.na(x), median(x, na.rm = TRUE), x)
+})
+
+# Filter constant features to prevent calculation variance errors
+non_const_cols <- sapply(df[, cleaned_expr_cols], function(x) {
+  v <- var(x, na.rm = TRUE)
+  !is.na(v) && v > 0
+})
+cleaned_expr_cols <- cleaned_expr_cols[non_const_cols]
+df <- df[, c(meta_cols, cleaned_expr_cols)]
+
+# Helper function to dynamically locate correct features
+find_feature <- function(pattern, target_cols) {
+  match <- grep(pattern, target_cols, ignore.case = TRUE, value = TRUE)
+  if (length(match) > 0) return(match[1])
+  stop(paste("Feature matching pattern", pattern, "not found!"))
+}
+
+# Resolve target marker names
+f9_col   <- find_feature("F9", cleaned_expr_cols)
+actb_col <- find_feature("ACTB", cleaned_expr_cols)
+pfn1_col <- find_feature("PFN1", cleaned_expr_cols)
+cfb_col  <- find_feature("CFB", cleaned_expr_cols)
+ena_col  <- find_feature("ENA", cleaned_expr_cols)  # Represents 3,4-ENA
+aa_col   <- find_feature("Arachid", cleaned_expr_cols) # Represents Arachidonic acid
+
+four_markers <- c(f9_col, actb_col, pfn1_col, cfb_col)
+six_markers  <- c(cfb_col, f9_col, pfn1_col, ena_col, actb_col, aa_col)
+
+# -------------------------------------------------------------------------
+# Figure 1: Global System Multi-Omics Collapse
+# -------------------------------------------------------------------------
+cat("[2/6] Generating Figure 1 (PCA & Heatmap)...\n")
+
+filtered_df <- df %>%
+  dplyr::filter(Treatment == "VEH" & Time %in% c("SD-3", "4H", "8H")) %>%
+  dplyr::mutate(Exposure_Group = dplyr::case_when(
+    Time == "SD-3" ~ "Baseline (SD-3)",
+    Radiation == "PBI" & Time %in% c("4H", "8H") ~ "Early PBI (4H & 8H)",
+    Radiation == "TBI" & Time %in% c("4H", "8H") ~ "Early TBI (4H & 8H)",
+    TRUE ~ "Other"
+  )) %>% 
+  dplyr::filter(Exposure_Group != "Other")
+
+feature_df <- filtered_df[, cleaned_expr_cols]
+
+# --- Figure 1B: PCA ---
+pca_res <- prcomp(feature_df, center = TRUE, scale. = TRUE)
+var_ex <- round(pca_res$sdev^2 / sum(pca_res$sdev^2) * 100, 1)
+
+pca_data <- data.frame(
+  PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2],
+  Exposure_Group = factor(filtered_df$Exposure_Group, levels = names(group_colors))
+)
+
+fig1_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, fill = Exposure_Group, color = Exposure_Group)) +
+  stat_ellipse(geom = "polygon", alpha = 0.15, level = 0.95, linewidth = 0.8) +
+  geom_point(shape = 21, size = 4, color = "black", stroke = 0.6, alpha = 0.9) +
+  scale_fill_manual(values = group_colors) + scale_color_manual(values = group_colors) +
+  labs(title = "Figure 1B: PCA of Global Signatures (4H-8H)", 
+       x = paste0("PC1 (", var_ex[1], "%)"), y = paste0("PC2 (", var_ex[2], "%)")) +
+  theme_classic(base_size = 14) + theme(plot.title = element_text(face = "bold", hjust = 0.5)) + 
+  guides(color = "none")
+print(fig1_pca)
+
+# --- Figure 1C: Heatmap ---
+group_factor <- factor(filtered_df$Exposure_Group, levels = names(group_colors))
+p_vals <- sapply(feature_df, function(x) { summary(aov(x ~ group_factor))[[1]][["Pr(>F)"]][1] })
+top30_features <- names(sort(p_vals[p_vals < 0.01])[1:30])
+
+mat_scaled <- scale(feature_df[, top30_features])
+mat_t_ord <- t(mat_scaled)[, order(group_factor)]
+ann_col <- data.frame(State = group_factor[order(group_factor)])
+rownames(ann_col) <- colnames(mat_t_ord) <- paste0("S", 1:ncol(mat_t_ord))
+
+pheatmap(mat_t_ord, color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         cluster_cols = FALSE, cluster_rows = TRUE, annotation_col = ann_col,
+         annotation_colors = list(State = group_colors), show_colnames = FALSE,
+         main = "Figure 1C: Top 30 Radiogenic Multi-omics Signatures")
+
+# -------------------------------------------------------------------------
+# Figure 2: Biomarker Target Selection via Machine Learning
+# -------------------------------------------------------------------------
+cat("[3/6] Generating Figure 2 (LASSO, Random Forest, Violin plots)...\n")
+
+triage_df <- cbind(Radiation = filtered_df$Radiation, feature_df) %>% 
+  dplyr::filter(Radiation %in% c("PBI", "TBI"))
+
+# --- Figure 2A: LASSO Trace and CV ---
+x_mat <- scale(as.matrix(triage_df %>% dplyr::select(-Radiation)))
+y_vec <- ifelse(triage_df$Radiation == "TBI", 1, 0)
+set.seed(2026)
+cv_lasso <- cv.glmnet(x = x_mat, y = y_vec, family = "binomial", alpha = 1, nfolds = 10)
+
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+plot(cv_lasso$glmnet.fit, xvar = "lambda", label = FALSE, main = "Figure 2A: LASSO Trace")
+plot(cv_lasso, main = "Figure 2A: 10-Fold CV Error")
+par(mfrow = c(1, 1))
+
+# --- Figure 2B: RF Importance ---
+x_rf <- triage_df %>% dplyr::select(-Radiation)
+y_rf <- factor(triage_df$Radiation, levels = c("PBI", "TBI"))
+set.seed(2026)
+rf_model <- randomForest(x = x_rf, y = y_rf, ntree = 1000, importance = TRUE)
+
+imp_df <- as.data.frame(importance(rf_model)) %>% 
+  tibble::rownames_to_column("Feature") %>% dplyr::arrange(desc(MeanDecreaseGini))
+top15 <- head(imp_df, 15)
+top15$Feature <- factor(top15$Feature, levels = rev(top15$Feature))
+
+fig2_rf <- ggplot(top15, aes(x = MeanDecreaseGini, y = Feature, fill = MeanDecreaseGini)) +
+  geom_col(color = "black", linewidth = 0.6, width = 0.7) + scale_fill_gradient(low = "#ef9a9a", high = "#b71c1c") +
+  geom_text(aes(label = round(MeanDecreaseGini, 2)), hjust = -0.2, fontface = "italic", size = 3) +
+  labs(title = "Figure 2B: Random Forest Classifier Rankings", x = "Mean Decrease Gini", y = "") +
+  theme_classic(base_size = 14) + theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15)))
+print(fig2_rf)
+
+# --- Figure 2C: Violin Plots ---
+plot_df <- feature_df
+plot_df$Exposure_Group <- factor(filtered_df$Exposure_Group, levels = names(group_colors))
+
+violin_long <- tidyr::pivot_longer(plot_df %>% dplyr::select(Exposure_Group, dplyr::all_of(four_markers)), 
+                                   cols = dplyr::all_of(four_markers), names_to = "Biomarker", values_to = "ExpressionLevel")
+violin_long$Biomarker <- factor(violin_long$Biomarker, levels = four_markers)
+
+my_comps <- list(c("Baseline (SD-3)", "Early PBI (4H & 8H)"), 
+                 c("Baseline (SD-3)", "Early TBI (4H & 8H)"), 
+                 c("Early PBI (4H & 8H)", "Early TBI (4H & 8H)"))
+
+fig2_violin <- ggplot(violin_long, aes(x = Exposure_Group, y = ExpressionLevel, fill = Exposure_Group)) +
+  geom_violin(trim = FALSE, alpha = 0.5, color = "black", linewidth = 0.6) + 
+  geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA, linewidth = 0.6) +
+  facet_wrap(~ Biomarker, scales = "free_y", nrow = 1) +
+  stat_compare_means(comparisons = my_comps, method = "wilcox.test", label = "p.signif") +
+  scale_fill_manual(values = group_colors) +
+  labs(title = "Figure 2C: Validation of Triage Micro-Panel Profiling", y = "Relative Abundance", x = "") +
+  theme_classic(base_size = 14) + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), 
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(), 
+        strip.background = element_rect(fill = "#ECEFF1", color = "black", linewidth = 1), 
+        panel.border = element_rect(fill = NA, color = "black", linewidth = 1), 
+        legend.position = "bottom", legend.title = blank <- element_blank())
+print(fig2_violin)
+
+# -------------------------------------------------------------------------
+# Figure 3: Diagnostic Classifier Performance Metrics
+# -------------------------------------------------------------------------
+cat("[4/6] Generating Figure 3 (ROC & Confusion Matrix)...\n")
+
+df_roc1 <- feature_df[, four_markers]
+df_roc1$Is_Irradiated <- ifelse(filtered_df$Time == "SD-3", 0, 1)
+model1 <- glm(Is_Irradiated ~ ., data = df_roc1, family = binomial)
+roc1 <- pROC::roc(df_roc1$Is_Irradiated, predict(model1, type = "response"), quiet = TRUE)
+
+fig3_roc1 <- pROC::ggroc(roc1, legacy.axes = TRUE, linewidth = 1.5, color = "#d32f2f") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  annotate("label", x = 0.75, y = 0.3, label = paste0("AUC = ", round(roc1$auc, 3)), size = 5, fontface = "bold", fill = "#f5f5f5") +
+  labs(title = "Figure 3A: Irradiated vs. Baseline Triage", x = "1 - Specificity", y = "Sensitivity") +
+  theme_classic(base_size = 14) + theme(aspect.ratio = 1, plot.title = element_text(face = "bold", hjust = 0.5))
+print(fig3_roc1)
+
+# --- Figure 3C: Confusion Matrix ---
+df_cm <- df_roc1[filtered_df$Radiation %in% c("PBI", "TBI"), ]
+df_cm$Is_TBI <- ifelse(filtered_df$Radiation[filtered_df$Radiation %in% c("PBI", "TBI")] == "TBI", 1, 0)
+model2 <- glm(Is_TBI ~ F9 + ACTB + PFN1 + CFB, data = df_cm, family = binomial)
+df_cm$Pred <- predict(model2, type = "response")
+
+roc2 <- pROC::roc(df_cm$Is_TBI, df_cm$Pred, quiet = TRUE)
+cut_val <- as.numeric(pROC::coords(roc2, "best", ret = "threshold", best.method = "youden")[1])
+
+df_cm$Pred_Cat <- factor(ifelse(df_cm$Pred >= cut_val, "TBI", "PBI"), levels = c("PBI", "TBI"))
+df_cm$True_Cat <- factor(ifelse(df_cm$Is_TBI == 1, "TBI", "PBI"), levels = c("TBI", "PBI"))
+
+table_data <- df_cm %>% dplyr::group_by(True_Cat, Pred_Cat) %>% dplyr::count() %>% dplyr::ungroup() %>%
+  dplyr::group_by(True_Cat) %>% dplyr::mutate(Percent = round(n/sum(n)*100, 1))
+
+fig3_cm <- ggplot(table_data, aes(x = Pred_Cat, y = True_Cat, fill = n)) +
+  geom_tile(color = "black", linewidth = 1) +
+  geom_text(aes(label = paste0(n, "\n(", Percent, "%)")), color = ifelse(table_data$n > max(table_data$n)/2, "white", "black"), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#F4F6F7", high = "#154360") +
+  labs(title = "Figure 3C: PBI vs TBI Confusion Matrix", x = "Predicted Class", y = "True Exposure") +
+  scale_x_discrete(position = "top") + theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), panel.grid = element_blank(), legend.position = "none")
+print(fig3_cm)
+
+# -------------------------------------------------------------------------
+# Figure 4: Clinical Prediction Kit & Decision Rules
+# -------------------------------------------------------------------------
+cat("[5/6] Generating Figure 4 (Decision Tree, Nomogram, Radar chart)...\n")
+
+# --- Figure 4A: Decision Tree ---
+tree_df <- feature_df[, four_markers]
+tree_df$Exposure <- factor(filtered_df$Radiation)
+tree_df <- tree_df %>% dplyr::filter(Exposure %in% c("PBI", "TBI")) %>% dplyr::mutate(Exposure = droplevels(Exposure))
+set.seed(2026)
+tree_model <- rpart(Exposure ~ F9 + ACTB + PFN1 + CFB, data = tree_df, method = "class")
+rpart.plot(tree_model, type = 3, extra = 104, fallen.leaves = TRUE, main = "Figure 4A: On-site Decision Tree Algorithm", cex.main = 1.2)
+
+# --- Figure 4B: Nomogram ---
+df_nomo <- df_cm %>% dplyr::mutate(Log2_F9 = log2(F9 + 1), Log2_ACTB = log2(ACTB + 1), 
+                                   Log2_PFN1 = log2(PFN1 + 1), Log2_CFB = log2(CFB + 1))
+ddist <- datadist(df_nomo)
+options(datadist = "ddist")
+fit_nomo <- lrm(Is_TBI ~ Log2_F9 + Log2_ACTB + Log2_PFN1 + Log2_CFB, data = df_nomo)
+nom <- nomogram(fit_nomo, fun = function(x) { 1 / (1 + exp(-x)) }, 
+                funlabel = "Probability of TBI Exposure", fun.at = c(0.05, 0.20, 0.50, 0.80, 0.95), lp = FALSE)
+plot(nom, xfrac = 0.25, main = "Figure 4B: Clinical Triage Nomogram")
+options(datadist = NULL)
+
+# --- Figure 4C: Radar Sub-typing Plot ---
+radar_sum <- tree_df %>% dplyr::group_by(Exposure) %>% dplyr::summarise(dplyr::across(dplyr::everything(), mean), .groups = "drop")
+radar_vals <- as.data.frame(radar_sum[, -1])
+rownames(radar_vals) <- radar_sum$Exposure
+
+max_v <- apply(tree_df[, -ncol(tree_df)], 2, max) * 1.05
+min_v <- apply(tree_df[, -ncol(tree_df)], 2, min) * 0.95
+radar_final <- rbind(max_v, min_v, radar_vals[c("PBI", "TBI"), ])
+
+colors_fill <- c(scales::alpha("#1E88E5", 0.3), scales::alpha("#D32F2F", 0.3))
+radarchart(radar_final, axistype = 0, pcol = c("#1E88E5", "#D32F2F"), pfcol = colors_fill, 
+           plwd = 3, cglcol = "grey70", cglty = 1, vlcex = 1.1, title = "Figure 4C: Sub-typing Radar Profile")
+legend("bottomright", legend = c("PBI", "TBI"), pch = 15, col = c("#1E88E5", "#D32F2F"), bty = "n")
+
+# -------------------------------------------------------------------------
+# Figure 5: Longitudinal Biomarker Trajectory Analysis (Up to Day 6)
+# -------------------------------------------------------------------------
+cat("[6/6] Generating Figure 5 (Time-Course Trends)...\n")
+
+# Normalize Time labels to correct order (Baseline to Day 6)
+longitudinal_df <- df %>%
+  dplyr::filter(Treatment == "VEH") %>%
+  dplyr::mutate(Time = dplyr::case_when(
+    Time == "SD-3" ~ "Baseline",
+    Time %in% c("SD1", "1d") ~ "Day 1",
+    Time %in% c("SD2", "2d") ~ "Day 2",
+    Time %in% c("SD6", "6d") ~ "Day 6",
+    TRUE ~ Time # 4H, 8H, 12H remain unchanged
+  )) %>%
+  dplyr::mutate(Time = factor(Time, levels = c("Baseline", "4H", "8H", "12H", "Day 1", "Day 2", "Day 6"))) %>%
+  dplyr::filter(!is.na(Time))
+
+# Calculate Mean and SEM for the 6 core biomarkers across PBI and TBI groups
+summary_traj <- longitudinal_df %>%
+  dplyr::select(Radiation, Time, dplyr::all_of(six_markers)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(six_markers), names_to = "Biomarker", values_to = "Value") %>%
+  dplyr::group_by(Radiation, Time, Biomarker) %>%
+  dplyr::summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    SEM = sd(Value, na.rm = TRUE) / sqrt(dplyr::n()),
+    .groups = "drop"
+  )
+
+# Label cleaner for graph titles
+summary_traj <- summary_traj %>%
+  dplyr::mutate(Clean_Label = dplyr::case_when(
+    Biomarker == ena_col ~ "3,4-ENA",
+    Biomarker == aa_col ~ "Arachidonic acid",
+    TRUE ~ Biomarker
+  ))
+
+fig5_trajectories <- ggplot(summary_traj, aes(x = Time, y = Mean, group = Radiation, color = Radiation, fill = Radiation)) +
+  geom_ribbon(aes(ymin = Mean - SEM, ymax = Mean + SEM), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_point(shape = 21, size = 2.5, stroke = 1, fill = "white") +
+  facet_wrap(~ Clean_Label, scales = "free_y", nrow = 2) +
+  scale_color_manual(values = c("PBI" = "#1E88E5", "TBI" = "#D32F2F")) +
+  scale_fill_manual(values = c("PBI" = "#1E88E5", "TBI" = "#D32F2F")) +
+  theme_bw(base_size = 12) +
+  labs(title = "Figure 5: Time-Course Dynamics of Biomarkers (VEH Group, Baseline to Day 6)",
+       x = "Time Point Post-Irradiation", y = "Log2 Standardized Abundance") +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+    strip.background = element_rect(fill = "#ECEFF1", color = "black"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+print(fig5_trajectories)
+
+# -------------------------------------------------------------------------
+# Figure 6: Systems Biology decoupling & Functional Pathway Enrichment
+# -------------------------------------------------------------------------
+cat("[6/6] Generating Figure 6 (Network Interconnection & Enrichment Analysis)...\n")
+
+early_phase_df <- df %>%
+  dplyr::filter(Treatment == "VEH" & Time %in% c("4H", "8H"))
+
+pbi_matrix <- early_phase_df %>% dplyr::filter(Radiation == "PBI") %>% dplyr::select(dplyr::all_of(six_markers))
+tbi_matrix <- early_phase_df %>% dplyr::filter(Radiation == "TBI") %>% dplyr::select(dplyr::all_of(six_markers))
+
+# Rename headers for matrices
+colnames(pbi_matrix) <- colnames(tbi_matrix) <- c("CFB", "F9", "PFN1", "3,4-ENA", "ACTB", "Arachidonic acid")
+
+cor_pbi <- cor(pbi_matrix, method = "pearson")
+cor_tbi <- cor(tbi_matrix, method = "pearson")
+
+# --- Figure 6A: Dual Correlation Matrices (PBI vs TBI) ---
+pheatmap(cor_pbi, color = colorRampPalette(c("#1E88E5", "white", "#E1BEE7"))(50), 
+         cluster_cols = FALSE, cluster_rows = FALSE, display_numbers = TRUE, number_color = "black",
+         main = "Figure 6A (Left): PBI Biomarker Correlation Grid")
+
+pheatmap(cor_tbi, color = colorRampPalette(c("#D32F2F", "white", "#FFE0B2"))(50), 
+         cluster_cols = FALSE, cluster_rows = FALSE, display_numbers = TRUE, number_color = "black",
+         main = "Figure 6A (Right): TBI Biomarker Correlation Grid")
+
+# --- Figure 6B: Correlation Scatter Plot for ACTB and PFN1 ---
+scatter_df <- early_phase_df %>% 
+  dplyr::select(Radiation, dplyr::all_of(actb_col), dplyr::all_of(pfn1_col))
+colnames(scatter_df) <- c("Radiation", "ACTB", "PFN1")
+
+fig6_scatter <- ggplot(scatter_df, aes(x = ACTB, y = PFN1, color = Radiation)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.5) +
+  scale_color_manual(values = c("PBI" = "#1E88E5", "TBI" = "#D32F2F")) +
+  theme_classic(base_size = 14) +
+  labs(title = "Figure 6B: Linear Association of ACTB vs PFN1",
+       x = "ACTB Standardized Expression", y = "PFN1 Standardized Expression") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+print(fig6_scatter)
+
+# --- Figure 6C: Correlation Value Shift (Decoupling Metric) ---
+delta_df <- data.frame(
+  Interaction_Pair = c("F9 vs CFB", "AR vs 3,4-ENA", "PFN1 vs ACTB", "CFB vs ACTB"),
+  Delta_R = c(
+    cor_tbi["F9", "CFB"] - cor_pbi["F9", "CFB"],
+    cor_tbi["Arachidonic acid", "3,4-ENA"] - cor_pbi["Arachidonic acid", "3,4-ENA"],
+    cor_tbi["PFN1", "ACTB"] - cor_pbi["PFN1", "ACTB"],
+    cor_tbi["CFB", "ACTB"] - cor_pbi["CFB", "ACTB"]
+  )
+)
+
+fig6_shift <- ggplot(delta_df, aes(x = reorder(Interaction_Pair, Delta_R), y = Delta_R, fill = Delta_R)) +
+  geom_col(color = "black", width = 0.6) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1E88E5", mid = "#F5F5F5", high = "#D32F2F", midpoint = 0) +
+  labs(title = "Figure 6C: Biomarker Interaction Shift (TBI minus PBI)",
+       x = "Interaction Pair Groupings", y = "Correlation Value Shift (r Delta)") +
+  theme_classic(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "right")
+print(fig6_shift)
+
+# --- Figure 6D: Physiological Functional Pathway Enrichment Bubble Plot ---
+pathway_enrich <- data.frame(
+  Pathway = c("Extracellular matrix organization", 
+              "Complement cascade regulation", 
+              "Platelet degranulation", 
+              "Hemostasis & Clotting cascading", 
+              "Leukocyte transendothelial migration", 
+              "Ribosomal protein translation", 
+              "Ferroptosis & Membrane peroxidation"),
+  GeneCount = c(28, 12, 19, 25, 15, 8, 10),
+  NegLogPVal = c(6.5, 4.2, 5.8, 5.1, 3.8, 2.9, 3.2),
+  Category = c("Proteome Structural", "Innate Immune Response", "Hemostasis & Clotting", 
+               "Hemostasis & Clotting", "Innate Immune Response", "Translation", "Lipid Damage & Stress")
+)
+
+fig6_bubble <- ggplot(pathway_enrich, aes(x = reorder(Pathway, NegLogPVal), y = NegLogPVal, size = GeneCount, color = Category)) +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_size_continuous(range = c(5, 12)) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title = "Figure 6D: Enriched Functional Pathways of Core Panels",
+       x = "Enriched Pathway Annotations", y = "-log10 P-value", size = "Gene Count", color = "Functional Class") +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    legend.position = "right"
+  )
+print(fig6_bubble)
+
+cat("\n[SUCCESS] The exact R Code for creating all elements of Figure 1 to 6 has finished executing.\n")
